@@ -8,12 +8,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <xf86drm.h>
-#include <sys/ioctl.h>
-#include <drm/i915_drm.h>
-#include <drm/xe_drm.h>
 #include <drm_fourcc.h>
 #include <gst/gst.h>
+#define GST_USE_UNSTABLE_API
+#include <gst/va/gstva.h>
+#include <gst/va/gstvadisplay_drm.h>
+#include <va/va.h>
+#include <va/va_drmcommon.h>
 #include <gst/base/gstbasetransform.h>
 #include <gst/video/video.h>
 #include <gst/video/gstvideometa.h>
@@ -44,8 +45,6 @@ GST_DEBUG_CATEGORY_STATIC (gst_icam_tile4_debug);
 G_DECLARE_FINAL_TYPE (GstIcamTile4Conv, gst_icam_tile4conv, GST,
     ICAM_TILE4CONV, GstBaseTransform)
 
-typedef enum { ICAM_DRV_NONE, ICAM_DRV_I915, ICAM_DRV_XE } IcamDrv;
-
 struct _GstIcamTile4Conv
 {
   GstBaseTransform parent;
@@ -53,8 +52,7 @@ struct _GstIcamTile4Conv
   GstVideoInfoDmaDrm in_drm, out_drm;
   GstVideoInfo in_info;
   GstAllocator *allocator;
-  IcamDrv drv;
-  int drm_fd;
+  GstVaDisplay *display;
   gchar *device;
   guint16 swz[TILE_H][TILE_W / 16];     /* [row][16B chunk] -> offset in tile */
 };
@@ -186,76 +184,65 @@ gst_icam_tile4conv_set_caps (GstBaseTransform * trans, GstCaps * incaps,
 
 /* ---------- output allocation ---------- */
 
-
 static gboolean
-ensure_device (GstIcamTile4Conv * self)
+ensure_display (GstIcamTile4Conv * self)
 {
-  if (self->drv != ICAM_DRV_NONE)
+  if (self->display)
     return TRUE;
-
-  int fd = open (self->device, O_RDWR | O_CLOEXEC);
-  if (fd < 0) {
-    GST_ERROR_OBJECT (self, "Cannot open %s: %s", self->device,
-        g_strerror (errno));
+  self->display = gst_va_display_drm_new_from_path (self->device);
+  if (!self->display) {
+    GST_ERROR_OBJECT (self, "Cannot create VA display on %s", self->device);
     return FALSE;
   }
-
-  drmVersionPtr ver = drmGetVersion (fd);
-  IcamDrv drv = ICAM_DRV_NONE;
-  if (ver) {
-    if (!g_strcmp0 (ver->name, "i915"))
-      drv = ICAM_DRV_I915;
-    else if (!g_strcmp0 (ver->name, "xe"))
-      drv = ICAM_DRV_XE;
-    else
-      GST_ERROR_OBJECT (self, "%s is driven by unsupported '%s'",
-          self->device, ver->name);
-    drmFreeVersion (ver);
-  }
-  if (drv == ICAM_DRV_NONE) {
-    close (fd);
-    return FALSE;
-  }
-  self->drm_fd = fd;
-  self->drv = drv;
   return TRUE;
 }
 
-/* Allocate plain GEM memory and export it as dmabuf. Returns fd or -1.
- * Tile4 is only a modifier/CPU-swizzle convention, so no tiling is set. */
-static int
-alloc_gem_dmabuf (GstIcamTile4Conv * self, gsize size, gsize * out_size)
+/* Create a Tile4 VA surface and export it as DRM PRIME 2. */
+static gboolean
+export_tile4_surface (GstIcamTile4Conv * self, VADRMPRIMESurfaceDescriptor * d)
 {
-  uint32_t handle = 0;
-  const gsize asize = ALIGN_UP (size, 4096);
+  VADisplay dpy = gst_va_display_get_va_dpy (self->display);
+  const GstVideoInfo *vi = &self->in_info;
+  const guint32 fourcc = self->in_drm.drm_fourcc;
+  const guint rt = (fourcc == DRM_FORMAT_NV12) ? VA_RT_FORMAT_YUV420
+      : VA_RT_FORMAT_YUV422;
+  uint64_t mods[1] = { I915_FORMAT_MOD_4_TILED };
+  VADRMFormatModifierList ml = { };
+  ml.num_modifiers = 1;
+  ml.modifiers = mods;
 
-  if (self->drv == ICAM_DRV_XE) {
-    struct drm_xe_gem_create c = { };
-    c.size = asize;
-    c.placement = 1 << 0;               /* system memory region */
-    c.cpu_caching = DRM_XE_GEM_CPU_CACHING_WB;
-    if (drmIoctl (self->drm_fd, DRM_IOCTL_XE_GEM_CREATE, &c) < 0)
-      return -1;
-    handle = c.handle;
-  } else {
-    struct drm_i915_gem_create c = { };
-    c.size = asize;
-    if (drmIoctl (self->drm_fd, DRM_IOCTL_I915_GEM_CREATE, &c) < 0)
-      return -1;
-    handle = c.handle;
+  VASurfaceAttrib attrs[3] = { };
+  attrs[0].type = VASurfaceAttribPixelFormat;
+  attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+  attrs[0].value.type = VAGenericValueTypeInteger;
+  attrs[0].value.value.i = (int) fourcc;
+  attrs[1].type = VASurfaceAttribUsageHint;
+  attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+  attrs[1].value.type = VAGenericValueTypeInteger;
+  attrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_GENERIC;
+  attrs[2].type = VASurfaceAttribDRMFormatModifiers;
+  attrs[2].flags = VA_SURFACE_ATTRIB_SETTABLE;
+  attrs[2].value.type = VAGenericValueTypePointer;
+  attrs[2].value.value.p = &ml;
+
+  VASurfaceID surf = VA_INVALID_SURFACE;
+  VAStatus s = vaCreateSurfaces (dpy, rt, GST_VIDEO_INFO_WIDTH (vi),
+      GST_VIDEO_INFO_HEIGHT (vi), &surf, 1, attrs, 3);
+  if (s == VA_STATUS_SUCCESS) {
+    s = vaExportSurfaceHandle (dpy, surf,
+        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        VA_EXPORT_SURFACE_READ_WRITE | VA_EXPORT_SURFACE_COMPOSED_LAYERS, d);
+    if (s == VA_STATUS_SUCCESS)
+      s = vaSyncSurface (dpy, surf);
+    /* exported fds keep the memory alive */
+    vaDestroySurfaces (dpy, &surf, 1);
   }
 
-  int fd = -1;
-  if (drmPrimeHandleToFD (self->drm_fd, handle, DRM_CLOEXEC | O_RDWR, &fd) < 0)
-    fd = -1;
-
-  /* the dmabuf fd keeps the object alive */
-  struct drm_gem_close gc = { };
-  gc.handle = handle;
-  drmIoctl (self->drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
-
-  *out_size = asize;
-  return fd;
+  if (s != VA_STATUS_SUCCESS) {
+    GST_ERROR_OBJECT (self, "VA Tile4 surface failed: %s", vaErrorStr (s));
+    return FALSE;
+  }
+  return TRUE;
 }
 
 static GstFlowReturn
@@ -264,42 +251,39 @@ gst_icam_tile4conv_prepare_output_buffer (GstBaseTransform * trans,
 {
   GstIcamTile4Conv *self = GST_ICAM_TILE4CONV (trans);
   GstVideoInfo *vi = &self->in_info;
-  const GstVideoFormatInfo *fi = vi->finfo;
   const guint w = GST_VIDEO_INFO_WIDTH (vi), h = GST_VIDEO_INFO_HEIGHT (vi);
   const guint np = GST_VIDEO_INFO_N_PLANES (vi);
   gsize offs[GST_VIDEO_MAX_PLANES] = { 0 };
   gint strides[GST_VIDEO_MAX_PLANES] = { 0 };
-  gsize total = 0;
+  VADRMPRIMESurfaceDescriptor d = { };
 
-  if (!ensure_device (self))
+  if (!ensure_display (self))
     return GST_FLOW_ERROR;
   if (!self->allocator)
     self->allocator = gst_dmabuf_allocator_new ();
-
-  /* Tile4 layout: stride multiple of 128B, rows padded to 32, 4KB-aligned planes */
-  for (guint p = 0; p < np; p++) {
-    const gsize row_bytes = GST_VIDEO_FORMAT_INFO_PSTRIDE (fi, p) *
-        GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (fi, p, w);
-    const guint rows = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (fi, p, h);
-
-    strides[p] = (gint) ALIGN_UP (row_bytes, TILE_W);
-    offs[p] = total;
-    total += ALIGN_UP ((gsize) rows, TILE_H) * strides[p];
-    total = ALIGN_UP (total, TILE_SIZE);
-  }
-
-  gsize bo_size = 0;
-  int fd = alloc_gem_dmabuf (self, total, &bo_size);
-  if (fd < 0) {
-    GST_ERROR_OBJECT (self, "GEM create/export failed on %s (%s) for %zu bytes: %s",
-        self->device, self->drv == ICAM_DRV_XE ? "xe" : "i915",
-        (size_t) total, g_strerror (errno));
+  if (!export_tile4_surface (self, &d))
     return GST_FLOW_ERROR;
+
+  if (d.num_layers != 1 || d.num_objects != 1 ||
+      d.layers[0].num_planes != np ||
+      d.objects[0].drm_format_modifier != I915_FORMAT_MOD_4_TILED) {
+    GST_ERROR_OBJECT (self, "Unexpected export: %u layers, %u objects, "
+        "%u planes, modifier 0x%" G_GINT64_MODIFIER "x", d.num_layers,
+        d.num_objects, d.layers[0].num_planes,
+        (guint64) d.objects[0].drm_format_modifier);
+    for (guint i = 0; i < d.num_objects; i++)
+      close (d.objects[i].fd);
+    return GST_FLOW_ERROR;
+  }
+  for (guint p = 0; p < np; p++) {
+    offs[p] = d.layers[0].offset[p];
+    strides[p] = d.layers[0].pitch[p];
   }
 
   GstBuffer *out = gst_buffer_new ();
   gst_buffer_append_memory (out,
-      gst_dmabuf_allocator_alloc (self->allocator, fd, bo_size));
+      gst_dmabuf_allocator_alloc (self->allocator, d.objects[0].fd,
+          d.objects[0].size));
   gst_buffer_add_video_meta_full (out, GST_VIDEO_FRAME_FLAG_NONE,
       GST_VIDEO_INFO_FORMAT (vi), w, h, np, offs, strides);
 
@@ -362,10 +346,7 @@ gst_icam_tile4conv_stop (GstBaseTransform * trans)
 {
   GstIcamTile4Conv *self = GST_ICAM_TILE4CONV (trans);
 
-  if (self->drm_fd >= 0)
-    close (self->drm_fd);
-  self->drm_fd = -1;
-  self->drv = ICAM_DRV_NONE;
+  gst_clear_object (&self->display);
   gst_clear_object (&self->allocator);
   return TRUE;
 }
@@ -440,7 +421,6 @@ gst_icam_tile4conv_class_init (GstIcamTile4ConvClass * klass)
 static void
 gst_icam_tile4conv_init (GstIcamTile4Conv * self)
 {
-  self->drm_fd = -1;
   self->device = g_strdup ("/dev/dri/renderD128");
   init_swizzle (self);
 }

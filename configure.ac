@@ -207,6 +207,9 @@ AS_IF([test "x$enable_icamtile4conv" = "xyes"], [
     gstreamer-base-1.0 >= $GST_TILE4_REQUIRED
     gstreamer-video-1.0 >= $GST_TILE4_REQUIRED
     gstreamer-allocators-1.0 >= $GST_TILE4_REQUIRED
+    gstreamer-va-1.0 >= $GST_TILE4_REQUIRED
+    libva
+    libva-drm
   ], [
     AC_SUBST(GST_TILE4_CFLAGS)
     AC_SUBST(GST_TILE4_LIBS)
