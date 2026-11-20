@@ -51,6 +51,10 @@ SUBDIRS = interfaces
 GST_API_VERSION=1.0
 plugin_LTLIBRARIES = libgsticamerasrc.la
 
+if BUILD_TILE4CONV
+plugin_LTLIBRARIES += libgsticamtile4conv.la
+endif
+
 ##############################################################################
 # TODO: for the next set of variables, name the prefix if you named the .la, #
 #  e.g. libmysomething.la => libmysomething_la_SOURCES                       #
@@ -113,3 +117,25 @@ noinst_HEADERS = gstcamerasrc.h \
                  gstcambasesrc.h \
                  gstcampushsrc.h \
                  utils.h
+
+##############################################################################
+# Linear -> Intel Tile4 DMABuf converter plugin (icamtile4conv)              #
+##############################################################################
+libgsticamtile4conv_la_SOURCES = tile4conv/gstcamtile4conv.cpp
+
+libgsticamtile4conv_la_CPPFLAGS = \
+    $(GST_CFLAGS) \
+    $(GST_TILE4_CFLAGS) \
+    $(LIBDRM_CFLAGS) \
+    $(GBM_CFLAGS) \
+    -std=c++11 \
+    -Werror \
+    -fstack-protector -fPIE -fPIC -Wformat -Wformat-security
+
+libgsticamtile4conv_la_LIBADD = $(GST_LIBS) \
+    $(GST_TILE4_LIBS) \
+    $(LIBDRM_LIBS) \
+    $(GBM_LIBS)
+
+libgsticamtile4conv_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS) \
+    -fPIE -fPIC -Wl,-z,relro -Wl,-z,now

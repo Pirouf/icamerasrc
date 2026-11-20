@@ -97,6 +97,11 @@ AC_ARG_WITH([androidstubs],
 AC_ARG_ENABLE([gstdrmformat],
   AC_HELP_STRING([--enable-gstdrmformat], [Enable DRM format [default=no]]))
 
+AC_ARG_ENABLE([icamtile4conv],
+  AS_HELP_STRING([--enable-icamtile4conv], [Build the Linear to Intel Tile4 DMABuf converter plugin (needs GStreamer >= 1.24 and gbm) [default=no]]),
+  [],
+  [enable_icamtile4conv=no])
+
 AC_ARG_ENABLE([internalbuild],
   AC_HELP_STRING([--enable-internalbuild], [Internal build [default=no]]))
 
@@ -179,11 +184,35 @@ PKG_CHECK_MODULES(CAMHAL, [libcamhal], [
   AC_MSG_ERROR([Cannot find libcamhal pkgconfig])
 ])
 
-PKG_CHECK_MODULES(LIBDRM, [libdrm libdrm_intel], [
-  AC_SUBST(LIBDRM_CFLAGS)
-  AC_SUBST(LIBDRM_LIBS)
+AS_IF([test "x$enable_icamtile4conv" = "xyes"], [
+  PKG_CHECK_MODULES([GBM], [gbm], [
+    AC_SUBST(GBM_CFLAGS)
+    AC_SUBST(GBM_LIBS)
+  ], [
+    AC_MSG_ERROR([Cannot find gbm pkgconfig (install libgbm-dev / mesa-libgbm-devel)])
+  ])
+
+  dnl icamtile4conv needs GstVideoInfoDmaDrm (GStreamer >= 1.24)
+  GST_TILE4_REQUIRED=1.24.0
+  PKG_CHECK_MODULES([GST_TILE4], [
+    gstreamer-1.0 >= $GST_TILE4_REQUIRED
+    gstreamer-base-1.0 >= $GST_TILE4_REQUIRED
+    gstreamer-video-1.0 >= $GST_TILE4_REQUIRED
+    gstreamer-allocators-1.0 >= $GST_TILE4_REQUIRED
+  ], [
+    AC_SUBST(GST_TILE4_CFLAGS)
+    AC_SUBST(GST_TILE4_LIBS)
+  ], [
+    AC_MSG_ERROR([icamtile4conv requires GStreamer >= $GST_TILE4_REQUIRED (gstreamer-video-1.0, gstreamer-allocators-1.0)])
+  ])
+])
+AM_CONDITIONAL([BUILD_TILE4CONV], [test "x$enable_icamtile4conv" = "xyes"])
+
+PKG_CHECK_MODULES([GBM], [gbm], [
+  AC_SUBST(GBM_CFLAGS)
+  AC_SUBST(GBM_LIBS)
 ], [
-  AC_MSG_ERROR([Cannot find libdrm pkgconfig])
+  AC_MSG_ERROR([Cannot find gbm pkgconfig (install libgbm-dev / mesa-libgbm-devel)])
 ])
 
 AS_IF([test "x$enable_gstdrmformat" = "xyes"], [
