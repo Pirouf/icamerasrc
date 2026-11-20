@@ -1,0 +1,71 @@
+Source: gst-plugins-icamera
+Section: libs
+Priority: optional
+Build-Depends:
+ debhelper-compat (= 12),
+ libcamhal-dev (>= 20260406~) | libcamhal-ipu7-dev (>= 20260406~),
+ libdrm-dev,
+ libgbm-dev,
+ libgstreamer-plugins-bad1.0-dev,
+ libgstreamer-plugins-base1.0-dev,
+ libgstreamer1.0-dev,
+ libva-dev,
+ pkg-config,
+Standards-Version: 4.5.0
+Maintainer: ECI Maintainer <eci.maintainer@intel.com>
+Vcs-Browser: https://github.com/intel/icamerasrc/tree/icamerasrc_slim_api
+Vcs-Git: https://github.com/intel/icamerasrc.git
+
+Package: libgsticamerainterface-1.0-1
+Replaces: icamerasrc
+Breaks: icamerasrc
+Conflicts: icamerasrc
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+Description: GStreamer MIPI camera through Intel IPU6/IPU7 interface (shared library)
+ GStreamer is a streaming media framework, based on graphs of filters
+ which operate on media data.  Applications using this library can do
+ anything from real-time sound processing to playing videos, and just
+ about anything else media-related.  Its plugin-based architecture means
+ that new data types or processing capabilities can be added simply by
+ installing new plug-ins.
+ .
+ This package contains shared library for GStreamer icamerasrc plugin.
+
+Package: libgsticamerainterface-1.0-dev
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libcamhal-dev (>= 20260406~) | libcamhal-ipu7-dev (>= 20260406~),
+ libgsticamerainterface-1.0-1 (= ${binary:Version}),
+Description: GStreamer MIPI camera through Intel IPU6/IPU7 interface (development files)
+ GStreamer is a streaming media framework, based on graphs of filters
+ which operate on media data.  Applications using this library can do
+ anything from real-time sound processing to playing videos, and just
+ about anything else media-related.  Its plugin-based architecture means
+ that new data types or processing capabilities can be added simply by
+ installing new plug-ins.
+ .
+ This package contains development files for GStreamer icamerasrc plugin.
+
+Package: gstreamer1.0-icamera
+Architecture: any
+Replaces: icamerasrc
+Breaks: icamerasrc
+Conflicts: icamerasrc
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libgsticamerainterface-1.0-1 (= ${binary:Version}),
+Description: MIPI camera through Intel IPU6/IPU7 plugin for GStreamer
+ GStreamer is a streaming media framework, based on graphs of filters
+ which operate on media data.  Applications using this library can do
+ anything from real-time sound processing to playing videos, and just
+ about anything else media-related.  Its plugin-based architecture means
+ that new data types or processing capabilities can be added simply by
+ installing new plug-ins.
+ .
+ This package contains the GStreamer icamerasrc plugin.

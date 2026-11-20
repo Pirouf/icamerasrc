@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/default.mk
+
+VERSION=$(shell dpkg-query --showformat='$${source:Upstream-Version}' -W libgstreamer1.0-dev)
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	if dpkg --compare-versions "$(VERSION)" lt "1.23"; then \
+		CHROME_SLIM_CAMHAL=ON dh_auto_configure; \
+	else \
+		CHROME_SLIM_CAMHAL=ON dh_auto_configure -- --enable-gstdrmformat=yes --enable-icamtile4conv=yes; \
+	fi
