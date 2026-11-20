@@ -48,6 +48,12 @@ EXTRA_DIST = autogen.sh
 pkgconfigdir = $(libdir)/pkgconfig
 pkgconfig_DATA = libgsticamerasrc.pc
 
+if BUILD_TILE4CONV
+pkgconfig_DATA += libgsticamtile4conv.pc
+endif
+
+EXTRA_DIST += libgsticamtile4conv.pc.in
+
 .PHONY: rpm
 rpm:
 	LIBDIR=$(libdir) ./rpm/build_rpm.sh ${BUILD_NUMBER}

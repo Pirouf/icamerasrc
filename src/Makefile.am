@@ -77,6 +77,7 @@ libgsticamerasrc_la_CPPFLAGS = \
     $(GST_CFLAGS) \
     $(CAMHAL_CFLAGS) \
     $(LIBDRM_CFLAGS) \
+    $(DRM_INTEL_CFLAGS) \
     $(DEP_GSTDRMFORMAT_CFLAGS) \
     -std=c++11 \
     -Werror \
@@ -96,6 +97,7 @@ libgsticamerasrc_la_LIBADD = $(GST_LIBS) \
     -lgstvideo-$(GST_API_VERSION) \
     interfaces/libgsticamerainterface-$(GST_API_VERSION).la \
     $(LIBDRM_LIBS) \
+    $(DRM_INTEL_LIBS) \
     $(DEP_GSTDRMFORMAT_LIBS) \
     $(CAMHAL_LIBS)
 
@@ -126,7 +128,6 @@ libgsticamtile4conv_la_SOURCES = tile4conv/gstcamtile4conv.cpp
 libgsticamtile4conv_la_CPPFLAGS = \
     $(GST_CFLAGS) \
     $(GST_TILE4_CFLAGS) \
-    $(LIBDRM_CFLAGS) \
     $(GBM_CFLAGS) \
     -std=c++11 \
     -Werror \
@@ -134,7 +135,6 @@ libgsticamtile4conv_la_CPPFLAGS = \
 
 libgsticamtile4conv_la_LIBADD = $(GST_LIBS) \
     $(GST_TILE4_LIBS) \
-    $(LIBDRM_LIBS) \
     $(GBM_LIBS)
 
 libgsticamtile4conv_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS) \

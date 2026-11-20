@@ -184,6 +184,13 @@ PKG_CHECK_MODULES(CAMHAL, [libcamhal], [
   AC_MSG_ERROR([Cannot find libcamhal pkgconfig])
 ])
 
+PKG_CHECK_MODULES([DRM_INTEL], [libdrm_intel], [
+  AC_SUBST(DRM_INTEL_CFLAGS)
+  AC_SUBST(DRM_INTEL_LIBS)
+], [
+  AC_MSG_ERROR([Cannot find libdrm_intel pkgconfig (install libdrm-intel1 / libdrm-dev)])
+])
+
 AS_IF([test "x$enable_icamtile4conv" = "xyes"], [
   PKG_CHECK_MODULES([GBM], [gbm], [
     AC_SUBST(GBM_CFLAGS)
@@ -302,5 +309,9 @@ AC_CONFIG_FILES([Makefile
                  src/interfaces/Makefile
                  libgsticamerasrc.pc
                 ])
+
+AS_IF([test "x$enable_icamtile4conv" = "xyes"], [
+  AC_CONFIG_FILES([libgsticamtile4conv.pc])
+])
 AC_OUTPUT
 
