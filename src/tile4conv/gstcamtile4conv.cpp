@@ -8,6 +8,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 #include <drm_fourcc.h>
 #include <gst/gst.h>
 #define GST_USE_UNSTABLE_API
@@ -296,6 +299,49 @@ gst_icam_tile4conv_prepare_output_buffer (GstBaseTransform * trans,
 
 /* ---------- transform ---------- */
 
+typedef struct
+{
+  void *base;
+  gsize len;
+  guint8 *data;
+  gsize size;
+  int fd;
+  guint64 sync;
+} DmaMap;
+
+/* mmap the dmabuf fd directly, bypassing the allocator's map function */
+static gboolean
+dma_map (GstBuffer * buf, gboolean write, DmaMap * m)
+{
+  GstMemory *mem = gst_buffer_peek_memory (buf, 0);
+  gsize off = 0, max = 0;
+
+  if (gst_buffer_n_memory (buf) != 1 || !gst_is_dmabuf_memory (mem))
+    return FALSE;
+  gst_memory_get_sizes (mem, &off, &max);
+  m->fd = gst_dmabuf_memory_get_fd (mem);
+  m->len = max;
+  m->base = mmap (NULL, m->len, PROT_READ | (write ? PROT_WRITE : 0),
+      MAP_SHARED, m->fd, 0);
+  if (m->base == MAP_FAILED)
+    return FALSE;
+  m->data = (guint8 *) m->base + off;
+  m->size = m->len - off;
+  m->sync = write ? DMA_BUF_SYNC_RW : DMA_BUF_SYNC_READ;
+
+  struct dma_buf_sync s = { DMA_BUF_SYNC_START | m->sync };
+  ioctl (m->fd, DMA_BUF_IOCTL_SYNC, &s);
+  return TRUE;
+}
+
+static void
+dma_unmap (DmaMap * m)
+{
+  struct dma_buf_sync s = { DMA_BUF_SYNC_END | m->sync };
+  ioctl (m->fd, DMA_BUF_IOCTL_SYNC, &s);
+  munmap (m->base, m->len);
+}
+
 static GstFlowReturn
 gst_icam_tile4conv_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     GstBuffer * outbuf)
@@ -305,15 +351,19 @@ gst_icam_tile4conv_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   const GstVideoFormatInfo *fi = vi->finfo;
   GstVideoMeta *im = gst_buffer_get_video_meta (inbuf);
   GstVideoMeta *om = gst_buffer_get_video_meta (outbuf);
-  GstMapInfo imap, omap;
+  DmaMap imap, omap;
   const guint w = GST_VIDEO_INFO_WIDTH (vi), h = GST_VIDEO_INFO_HEIGHT (vi);
 
   if (!om)
     return GST_FLOW_ERROR;
-  if (!gst_buffer_map (inbuf, &imap, GST_MAP_READ))
+  if (!dma_map (inbuf, FALSE, &imap)) {
+    GST_ERROR_OBJECT (self, "Cannot mmap input dmabuf: %s", g_strerror (errno));
     return GST_FLOW_ERROR;
-  if (!gst_buffer_map (outbuf, &omap, GST_MAP_WRITE)) {
-    gst_buffer_unmap (inbuf, &imap);
+  }
+  if (!dma_map (outbuf, TRUE, &omap)) {
+    GST_ERROR_OBJECT (self, "Cannot mmap output dmabuf: %s",
+        g_strerror (errno));
+    dma_unmap (&imap);
     return GST_FLOW_ERROR;
   }
 
@@ -327,6 +377,13 @@ gst_icam_tile4conv_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     const gsize need = (gsize) ((rows + TILE_H - 1) / TILE_H) * om->stride[p]
         * TILE_H + om->offset[p];
 
+    if (sstr <= 0 || rows == 0 ||
+        soff + (gsize) sstr * (rows - 1) + row_bytes > imap.size) {
+      GST_ERROR_OBJECT (self, "Input plane %u out of bounds (offset %zu, "
+          "stride %d, size %zu)", p, (size_t) soff, sstr, (size_t) imap.size);
+      ret = GST_FLOW_ERROR;
+      break;
+    }
     if (om->stride[p] % TILE_W || need > omap.size) {
       GST_ERROR_OBJECT (self, "Output plane %u layout invalid", p);
       ret = GST_FLOW_ERROR;
@@ -336,8 +393,8 @@ gst_icam_tile4conv_transform (GstBaseTransform * trans, GstBuffer * inbuf,
         omap.data + om->offset[p], om->stride[p], row_bytes, rows);
   }
 
-  gst_buffer_unmap (outbuf, &omap);
-  gst_buffer_unmap (inbuf, &imap);
+  dma_unmap (&omap);
+  dma_unmap (&imap);
   return ret;
 }
 
