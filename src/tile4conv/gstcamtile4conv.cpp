@@ -8,7 +8,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include "libdrm/intel_bufmgr.h"
+#include <xf86drm.h>
+#include <sys/ioctl.h>
+#include <drm/i915_drm.h>
+#include <drm/xe_drm.h>
 #include <drm_fourcc.h>
 #include <gst/gst.h>
 #include <gst/base/gstbasetransform.h>
@@ -20,9 +23,6 @@
 #define I915_FORMAT_MOD_4_TILED fourcc_mod_code(INTEL, 9)
 #endif
 
-#ifndef I915_TILING_NONE
-#define I915_TILING_NONE 0
-#endif
 
 #define ALIGN_UP(v, a) (((v) + (a) - 1) / (a) * (a))
 
@@ -44,6 +44,8 @@ GST_DEBUG_CATEGORY_STATIC (gst_icam_tile4_debug);
 G_DECLARE_FINAL_TYPE (GstIcamTile4Conv, gst_icam_tile4conv, GST,
     ICAM_TILE4CONV, GstBaseTransform)
 
+typedef enum { ICAM_DRV_NONE, ICAM_DRV_I915, ICAM_DRV_XE } IcamDrv;
+
 struct _GstIcamTile4Conv
 {
   GstBaseTransform parent;
@@ -51,7 +53,7 @@ struct _GstIcamTile4Conv
   GstVideoInfoDmaDrm in_drm, out_drm;
   GstVideoInfo in_info;
   GstAllocator *allocator;
-  drm_intel_bufmgr *bufmgr;
+  IcamDrv drv;
   int drm_fd;
   gchar *device;
   guint16 swz[TILE_H][TILE_W / 16];     /* [row][16B chunk] -> offset in tile */
@@ -184,25 +186,76 @@ gst_icam_tile4conv_set_caps (GstBaseTransform * trans, GstCaps * incaps,
 
 /* ---------- output allocation ---------- */
 
+
 static gboolean
-ensure_bufmgr (GstIcamTile4Conv * self)
+ensure_device (GstIcamTile4Conv * self)
 {
-  if (self->bufmgr)
+  if (self->drv != ICAM_DRV_NONE)
     return TRUE;
-  self->drm_fd = open (self->device, O_RDWR | O_CLOEXEC);
-  if (self->drm_fd < 0) {
+
+  int fd = open (self->device, O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
     GST_ERROR_OBJECT (self, "Cannot open %s: %s", self->device,
         g_strerror (errno));
     return FALSE;
   }
-  self->bufmgr = drm_intel_bufmgr_gem_init (self->drm_fd, 4096);
-  if (!self->bufmgr) {
-    GST_ERROR_OBJECT (self, "drm_intel_bufmgr_gem_init failed");
-    close (self->drm_fd);
-    self->drm_fd = -1;
+
+  drmVersionPtr ver = drmGetVersion (fd);
+  IcamDrv drv = ICAM_DRV_NONE;
+  if (ver) {
+    if (!g_strcmp0 (ver->name, "i915"))
+      drv = ICAM_DRV_I915;
+    else if (!g_strcmp0 (ver->name, "xe"))
+      drv = ICAM_DRV_XE;
+    else
+      GST_ERROR_OBJECT (self, "%s is driven by unsupported '%s'",
+          self->device, ver->name);
+    drmFreeVersion (ver);
+  }
+  if (drv == ICAM_DRV_NONE) {
+    close (fd);
     return FALSE;
   }
+  self->drm_fd = fd;
+  self->drv = drv;
   return TRUE;
+}
+
+/* Allocate plain GEM memory and export it as dmabuf. Returns fd or -1.
+ * Tile4 is only a modifier/CPU-swizzle convention, so no tiling is set. */
+static int
+alloc_gem_dmabuf (GstIcamTile4Conv * self, gsize size, gsize * out_size)
+{
+  uint32_t handle = 0;
+  const gsize asize = ALIGN_UP (size, 4096);
+
+  if (self->drv == ICAM_DRV_XE) {
+    struct drm_xe_gem_create c = { };
+    c.size = asize;
+    c.placement = 1 << 0;               /* system memory region */
+    c.cpu_caching = DRM_XE_GEM_CPU_CACHING_WB;
+    if (drmIoctl (self->drm_fd, DRM_IOCTL_XE_GEM_CREATE, &c) < 0)
+      return -1;
+    handle = c.handle;
+  } else {
+    struct drm_i915_gem_create c = { };
+    c.size = asize;
+    if (drmIoctl (self->drm_fd, DRM_IOCTL_I915_GEM_CREATE, &c) < 0)
+      return -1;
+    handle = c.handle;
+  }
+
+  int fd = -1;
+  if (drmPrimeHandleToFD (self->drm_fd, handle, DRM_CLOEXEC | O_RDWR, &fd) < 0)
+    fd = -1;
+
+  /* the dmabuf fd keeps the object alive */
+  struct drm_gem_close gc = { };
+  gc.handle = handle;
+  drmIoctl (self->drm_fd, DRM_IOCTL_GEM_CLOSE, &gc);
+
+  *out_size = asize;
+  return fd;
 }
 
 static GstFlowReturn
@@ -218,7 +271,7 @@ gst_icam_tile4conv_prepare_output_buffer (GstBaseTransform * trans,
   gint strides[GST_VIDEO_MAX_PLANES] = { 0 };
   gsize total = 0;
 
-  if (!ensure_bufmgr (self))
+  if (!ensure_device (self))
     return GST_FLOW_ERROR;
   if (!self->allocator)
     self->allocator = gst_dmabuf_allocator_new ();
@@ -235,27 +288,12 @@ gst_icam_tile4conv_prepare_output_buffer (GstBaseTransform * trans,
     total = ALIGN_UP (total, TILE_SIZE);
   }
 
-  /* Linear GEM object: one 4KB "row" per tile, 1 byte per pixel */
-  uint32_t tiling = I915_TILING_NONE;
-  unsigned long pitch = 0;
-  drm_intel_bo *bo = drm_intel_bo_alloc_tiled (self->bufmgr, "ICAM_TILE4",
-      TILE_SIZE, (int) (total / TILE_SIZE), 1, &tiling, &pitch, 0);
-  if (!bo) {
-    GST_ERROR_OBJECT (self, "drm_intel_bo_alloc_tiled failed for %zu bytes",
-        (size_t) total);
-    return GST_FLOW_ERROR;
-  }
-
-  int fd = -1;
-  drm_intel_bo_gem_export_to_prime (bo, &fd);
-  const gsize bo_size = bo->size;
-  /* the dmabuf fd keeps the buffer alive */
-  drm_intel_bo_unreference (bo);
-  if (fd < 0 || bo_size < total) {
-    GST_ERROR_OBJECT (self, "PRIME export failed (fd %d, size %zu < %zu)",
-        fd, (size_t) bo_size, (size_t) total);
-    if (fd >= 0)
-      close (fd);
+  gsize bo_size = 0;
+  int fd = alloc_gem_dmabuf (self, total, &bo_size);
+  if (fd < 0) {
+    GST_ERROR_OBJECT (self, "GEM create/export failed on %s (%s) for %zu bytes: %s",
+        self->device, self->drv == ICAM_DRV_XE ? "xe" : "i915",
+        (size_t) total, g_strerror (errno));
     return GST_FLOW_ERROR;
   }
 
@@ -324,12 +362,10 @@ gst_icam_tile4conv_stop (GstBaseTransform * trans)
 {
   GstIcamTile4Conv *self = GST_ICAM_TILE4CONV (trans);
 
-  if (self->bufmgr)
-    drm_intel_bufmgr_destroy (self->bufmgr);
-  self->bufmgr = NULL;
   if (self->drm_fd >= 0)
     close (self->drm_fd);
   self->drm_fd = -1;
+  self->drv = ICAM_DRV_NONE;
   gst_clear_object (&self->allocator);
   return TRUE;
 }

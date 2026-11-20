@@ -184,6 +184,13 @@ PKG_CHECK_MODULES(CAMHAL, [libcamhal], [
   AC_MSG_ERROR([Cannot find libcamhal pkgconfig])
 ])
 
+PKG_CHECK_MODULES([LIBDRM], [libdrm], [
+  AC_SUBST(LIBDRM_CFLAGS)
+  AC_SUBST(LIBDRM_LIBS)
+], [
+  AC_MSG_ERROR([Cannot find libdrm pkgconfig])
+])
+
 PKG_CHECK_MODULES([DRM_INTEL], [libdrm_intel], [
   AC_SUBST(DRM_INTEL_CFLAGS)
   AC_SUBST(DRM_INTEL_LIBS)
