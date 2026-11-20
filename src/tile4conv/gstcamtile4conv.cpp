@@ -2,7 +2,6 @@
 #include "config.h"
 #endif
 
-#include <algorithm>
 #include <cstring>
 #include <errno.h>
 #include <fcntl.h>
@@ -27,13 +26,7 @@
 #define I915_FORMAT_MOD_4_TILED fourcc_mod_code(INTEL, 9)
 #endif
 
-
-#define ALIGN_UP(v, a) (((v) + (a) - 1) / (a) * (a))
-
 #define TILE4_MOD_STR ":0x0100000000000009"
-#define TILE_W 128
-#define TILE_H 32
-#define TILE_SIZE 4096
 
 #define SINK_CAPS "video/x-raw(memory:DMABuf), format=(string)DMA_DRM, " \
   "drm-format=(string){ UYVY, NV12, YUYV }"
@@ -56,8 +49,8 @@ struct _GstIcamTile4Conv
   GstVideoInfo in_info;
   GstAllocator *allocator;
   GstVaDisplay *display;
+  VASurfaceID surf;             /* surface of the buffer being produced */
   gchar *device;
-  guint16 swz[TILE_H][TILE_W / 16];     /* [row][16B chunk] -> offset in tile */
 };
 
 G_DEFINE_TYPE (GstIcamTile4Conv, gst_icam_tile4conv, GST_TYPE_BASE_TRANSFORM)
@@ -66,40 +59,6 @@ static GstStaticPadTemplate sink_t = GST_STATIC_PAD_TEMPLATE ("sink",
     GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS (SINK_CAPS));
 static GstStaticPadTemplate src_t = GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS (SRC_CAPS));
-
-/* In-tile byte offset bits (4KB tile = 128B x 32 rows):
- * [3:0]=x0-3 [5:4]=y0-1 [6]=x4 [7]=y2 [8]=x5 [9]=y3 [10]=x6 [11]=y4
- * NOTE: verify against Mesa isl before production use. */
-static void
-init_swizzle (GstIcamTile4Conv * self)
-{
-  for (guint y = 0; y < TILE_H; y++)
-    for (guint c = 0; c < TILE_W / 16; c++)
-      self->swz[y][c] = (guint16) (((y & 3) << 4) | ((c & 1) << 6)
-          | (((y >> 2) & 1) << 7) | (((c >> 1) & 1) << 8)
-          | (((y >> 3) & 1) << 9) | (((c >> 2) & 1) << 10)
-          | (((y >> 4) & 1) << 11));
-}
-
-static void
-copy_plane_to_tile4 (GstIcamTile4Conv * self, const guint8 * src,
-    gsize src_stride, guint8 * dst, gsize dst_stride, gsize row_bytes,
-    guint rows)
-{
-  const gsize tiles_per_row = dst_stride / TILE_W;
-
-  for (guint y = 0; y < rows; y++) {
-    const gsize ty = y / TILE_H, iy = y % TILE_H;
-    const guint8 *s = src + y * src_stride;
-
-    for (gsize x = 0; x < row_bytes; x += 16) {
-      const gsize tx = x / TILE_W, c = (x % TILE_W) / 16;
-      const gsize n = std::min<gsize> (16, row_bytes - x);
-      std::memcpy (dst + (ty * tiles_per_row + tx) * TILE_SIZE
-          + self->swz[iy][c], s + x, n);
-    }
-  }
-}
 
 /* ---------- caps ---------- */
 
@@ -187,6 +146,15 @@ gst_icam_tile4conv_set_caps (GstBaseTransform * trans, GstCaps * incaps,
 
 /* ---------- output allocation ---------- */
 
+static void
+drop_surface (GstIcamTile4Conv * self)
+{
+  if (self->surf != VA_INVALID_SURFACE && self->display)
+    vaDestroySurfaces (gst_va_display_get_va_dpy (self->display),
+        &self->surf, 1);
+  self->surf = VA_INVALID_SURFACE;
+}
+
 static gboolean
 ensure_display (GstIcamTile4Conv * self)
 {
@@ -228,6 +196,7 @@ export_tile4_surface (GstIcamTile4Conv * self, VADRMPRIMESurfaceDescriptor * d)
   attrs[2].value.type = VAGenericValueTypePointer;
   attrs[2].value.value.p = &ml;
 
+  drop_surface (self);
   VASurfaceID surf = VA_INVALID_SURFACE;
   VAStatus s = vaCreateSurfaces (dpy, rt, GST_VIDEO_INFO_WIDTH (vi),
       GST_VIDEO_INFO_HEIGHT (vi), &surf, 1, attrs, 3);
@@ -236,9 +205,9 @@ export_tile4_surface (GstIcamTile4Conv * self, VADRMPRIMESurfaceDescriptor * d)
         VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
         VA_EXPORT_SURFACE_READ_WRITE | VA_EXPORT_SURFACE_COMPOSED_LAYERS, d);
     if (s == VA_STATUS_SUCCESS)
-      s = vaSyncSurface (dpy, surf);
-    /* exported fds keep the memory alive */
-    vaDestroySurfaces (dpy, &surf, 1);
+      self->surf = surf;        /* kept until transform() has uploaded */
+    else
+      vaDestroySurfaces (dpy, &surf, 1);
   }
 
   if (s != VA_STATUS_SUCCESS) {
@@ -276,6 +245,7 @@ gst_icam_tile4conv_prepare_output_buffer (GstBaseTransform * trans,
         (guint64) d.objects[0].drm_format_modifier);
     for (guint i = 0; i < d.num_objects; i++)
       close (d.objects[i].fd);
+    drop_surface (self);
     return GST_FLOW_ERROR;
   }
   for (guint p = 0; p < np; p++) {
@@ -350,51 +320,74 @@ gst_icam_tile4conv_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   GstVideoInfo *vi = &self->in_info;
   const GstVideoFormatInfo *fi = vi->finfo;
   GstVideoMeta *im = gst_buffer_get_video_meta (inbuf);
-  GstVideoMeta *om = gst_buffer_get_video_meta (outbuf);
-  DmaMap imap, omap;
   const guint w = GST_VIDEO_INFO_WIDTH (vi), h = GST_VIDEO_INFO_HEIGHT (vi);
+  DmaMap imap;
 
-  if (!om)
+  if (self->surf == VA_INVALID_SURFACE)
     return GST_FLOW_ERROR;
   if (!dma_map (inbuf, FALSE, &imap)) {
     GST_ERROR_OBJECT (self, "Cannot mmap input dmabuf: %s", g_strerror (errno));
-    return GST_FLOW_ERROR;
-  }
-  if (!dma_map (outbuf, TRUE, &omap)) {
-    GST_ERROR_OBJECT (self, "Cannot mmap output dmabuf: %s",
-        g_strerror (errno));
-    dma_unmap (&imap);
+    drop_surface (self);
     return GST_FLOW_ERROR;
   }
 
-  GstFlowReturn ret = GST_FLOW_OK;
-  for (guint p = 0; p < GST_VIDEO_INFO_N_PLANES (vi); p++) {
-    const gsize soff = im ? im->offset[p] : GST_VIDEO_INFO_PLANE_OFFSET (vi, p);
-    const gint sstr = im ? im->stride[p] : GST_VIDEO_INFO_PLANE_STRIDE (vi, p);
-    const gsize row_bytes = GST_VIDEO_FORMAT_INFO_PSTRIDE (fi, p) *
-        GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (fi, p, w);
-    const guint rows = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (fi, p, h);
-    const gsize need = (gsize) ((rows + TILE_H - 1) / TILE_H) * om->stride[p]
-        * TILE_H + om->offset[p];
+  VADisplay dpy = gst_va_display_get_va_dpy (self->display);
+  VAImage img = { };
+  void *dst = NULL;
+  GstFlowReturn ret = GST_FLOW_ERROR;
+  gboolean have_img = FALSE;
 
-    if (sstr <= 0 || rows == 0 ||
-        soff + (gsize) sstr * (rows - 1) + row_bytes > imap.size) {
-      GST_ERROR_OBJECT (self, "Input plane %u out of bounds (offset %zu, "
-          "stride %d, size %zu)", p, (size_t) soff, sstr, (size_t) imap.size);
-      ret = GST_FLOW_ERROR;
-      break;
-    }
-    if (om->stride[p] % TILE_W || need > omap.size) {
-      GST_ERROR_OBJECT (self, "Output plane %u layout invalid", p);
-      ret = GST_FLOW_ERROR;
-      break;
-    }
-    copy_plane_to_tile4 (self, imap.data + soff, sstr,
-        omap.data + om->offset[p], om->stride[p], row_bytes, rows);
+  VAStatus s = vaDeriveImage (dpy, self->surf, &img);
+  if (s == VA_STATUS_SUCCESS) {
+    have_img = TRUE;
+    s = vaMapBuffer (dpy, img.buf, &dst);
   }
 
-  dma_unmap (&omap);
+  if (s != VA_STATUS_SUCCESS) {
+    GST_ERROR_OBJECT (self, "VA map of Tile4 surface failed: %s",
+        vaErrorStr (s));
+    dst = NULL;
+  } else {
+    ret = GST_FLOW_OK;
+    for (guint p = 0; p < GST_VIDEO_INFO_N_PLANES (vi); p++) {
+      const gsize soff = im ? im->offset[p]
+          : GST_VIDEO_INFO_PLANE_OFFSET (vi, p);
+      const gint sstr = im ? im->stride[p]
+          : GST_VIDEO_INFO_PLANE_STRIDE (vi, p);
+      const gsize row_bytes = GST_VIDEO_FORMAT_INFO_PSTRIDE (fi, p) *
+          GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (fi, p, w);
+      const guint rows = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (fi, p, h);
+
+      if (sstr <= 0 || rows == 0 ||
+          soff + (gsize) sstr * (rows - 1) + row_bytes > imap.size) {
+        GST_ERROR_OBJECT (self, "Input plane %u out of bounds", p);
+        ret = GST_FLOW_ERROR;
+        break;
+      }
+      if (p >= img.num_planes || img.pitches[p] < row_bytes ||
+          img.offsets[p] + (gsize) img.pitches[p] * (rows - 1) + row_bytes
+          > img.data_size) {
+        GST_ERROR_OBJECT (self, "VA image plane %u layout invalid", p);
+        ret = GST_FLOW_ERROR;
+        break;
+      }
+      /* linear copy; the VA driver tiles on unmap */
+      for (guint y = 0; y < rows; y++)
+        std::memcpy ((guint8 *) dst + img.offsets[p]
+            + (gsize) y * img.pitches[p],
+            imap.data + soff + (gsize) y * sstr, row_bytes);
+    }
+  }
+
+  if (dst)
+    vaUnmapBuffer (dpy, img.buf);
+  if (have_img)
+    vaDestroyImage (dpy, img.image_id);
+  if (ret == GST_FLOW_OK)
+    vaSyncSurface (dpy, self->surf);
+
   dma_unmap (&imap);
+  drop_surface (self);          /* the exported fd keeps the memory alive */
   return ret;
 }
 
@@ -403,6 +396,7 @@ gst_icam_tile4conv_stop (GstBaseTransform * trans)
 {
   GstIcamTile4Conv *self = GST_ICAM_TILE4CONV (trans);
 
+  drop_surface (self);
   gst_clear_object (&self->display);
   gst_clear_object (&self->allocator);
   return TRUE;
@@ -479,7 +473,7 @@ static void
 gst_icam_tile4conv_init (GstIcamTile4Conv * self)
 {
   self->device = g_strdup ("/dev/dri/renderD128");
-  init_swizzle (self);
+  self->surf = VA_INVALID_SURFACE;
 }
 
 static gboolean
