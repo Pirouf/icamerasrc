@@ -5,7 +5,6 @@ Build-Depends:
  debhelper-compat (= 12),
  libcamhal-dev (>= 20260406~) | libcamhal-ipu7-dev (>= 20260406~),
  libdrm-dev,
- libgbm-dev,
  libgstreamer-plugins-bad1.0-dev,
  libgstreamer-plugins-base1.0-dev,
  libgstreamer1.0-dev,
