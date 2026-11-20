@@ -47,10 +47,7 @@ struct _GstIcamTile4Conv
 
   GstVideoInfoDmaDrm in_drm, out_drm;
   GstVideoInfo in_info;
-  GstAllocator *allocator;
-  GstVaDisplay *display;
-  VASurfaceID surf;             /* surface of the buffer being produced */
-  gchar *device;
+  gchar *device;                /* unused now: downstream's VA display is used */
 };
 
 G_DEFINE_TYPE (GstIcamTile4Conv, gst_icam_tile4conv, GST_TYPE_BASE_TRANSFORM)
@@ -161,144 +158,26 @@ gst_icam_tile4conv_set_caps (GstBaseTransform * trans, GstCaps * incaps,
 
 /* ---------- output allocation ---------- */
 
-static void
-drop_surface (GstIcamTile4Conv * self)
-{
-  if (self->surf != VA_INVALID_SURFACE && self->display) {
-    GST_DEBUG_OBJECT (self, "destroying VA surface 0x%x", self->surf);
-    vaDestroySurfaces (gst_va_display_get_va_dpy (self->display),
-        &self->surf, 1);
-  }
-  self->surf = VA_INVALID_SURFACE;
-}
 
+/* Use the Tile4 VA pool proposed by downstream (e.g. vacompositor). */
 static gboolean
-ensure_display (GstIcamTile4Conv * self)
+gst_icam_tile4conv_decide_allocation (GstBaseTransform * trans,
+    GstQuery * query)
 {
-  if (self->display)
-    return TRUE;
-  GST_INFO_OBJECT (self, "creating VA display on %s", self->device);
-  self->display = gst_va_display_drm_new_from_path (self->device);
-  if (!self->display) {
-    GST_ERROR_OBJECT (self, "Cannot create VA display on %s", self->device);
+  GstBufferPool *pool = NULL;
+
+  if (gst_query_get_n_allocation_pools (query) > 0)
+    gst_query_parse_nth_allocation_pool (query, 0, &pool, NULL, NULL, NULL);
+  if (!pool) {
+    GST_ERROR_OBJECT (trans, "downstream proposed no buffer pool; a VA "
+        "element providing Tile4 buffers is required");
     return FALSE;
   }
-  GST_INFO_OBJECT (self, "VA display ready: %s",
-      vaQueryVendorString (gst_va_display_get_va_dpy (self->display)));
-  return TRUE;
-}
+  GST_INFO_OBJECT (trans, "using downstream pool %" GST_PTR_FORMAT, pool);
+  gst_object_unref (pool);
 
-/* Create a Tile4 VA surface and export it as DRM PRIME 2. */
-static gboolean
-export_tile4_surface (GstIcamTile4Conv * self, VADRMPRIMESurfaceDescriptor * d)
-{
-  VADisplay dpy = gst_va_display_get_va_dpy (self->display);
-  const GstVideoInfo *vi = &self->in_info;
-  const guint32 fourcc = self->in_drm.drm_fourcc;
-  const guint rt = (fourcc == DRM_FORMAT_NV12) ? VA_RT_FORMAT_YUV420
-      : VA_RT_FORMAT_YUV422;
-  uint64_t mods[1] = { I915_FORMAT_MOD_4_TILED };
-  VADRMFormatModifierList ml = { };
-  ml.num_modifiers = 1;
-  ml.modifiers = mods;
-
-  VASurfaceAttrib attrs[3] = { };
-  attrs[0].type = VASurfaceAttribPixelFormat;
-  attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
-  attrs[0].value.type = VAGenericValueTypeInteger;
-  attrs[0].value.value.i = (int) fourcc;
-  attrs[1].type = VASurfaceAttribUsageHint;
-  attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
-  attrs[1].value.type = VAGenericValueTypeInteger;
-  attrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_GENERIC;
-  attrs[2].type = VASurfaceAttribDRMFormatModifiers;
-  attrs[2].flags = VA_SURFACE_ATTRIB_SETTABLE;
-  attrs[2].value.type = VAGenericValueTypePointer;
-  attrs[2].value.value.p = &ml;
-
-  drop_surface (self);
-  GST_DEBUG_OBJECT (self, "creating Tile4 VA surface %" GST_FOURCC_FORMAT
-      " %dx%d, rt format 0x%x", GST_FOURCC_ARGS (fourcc),
-      GST_VIDEO_INFO_WIDTH (vi), GST_VIDEO_INFO_HEIGHT (vi), rt);
-  VASurfaceID surf = VA_INVALID_SURFACE;
-  VAStatus s = vaCreateSurfaces (dpy, rt, GST_VIDEO_INFO_WIDTH (vi),
-      GST_VIDEO_INFO_HEIGHT (vi), &surf, 1, attrs, 3);
-  if (s == VA_STATUS_SUCCESS) {
-    s = vaExportSurfaceHandle (dpy, surf,
-        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-        VA_EXPORT_SURFACE_READ_WRITE | VA_EXPORT_SURFACE_COMPOSED_LAYERS, d);
-    if (s == VA_STATUS_SUCCESS)
-      self->surf = surf;        /* kept until transform() has uploaded */
-    else
-      vaDestroySurfaces (dpy, &surf, 1);
-  }
-
-  if (s != VA_STATUS_SUCCESS) {
-    GST_ERROR_OBJECT (self, "VA Tile4 surface failed: %s", vaErrorStr (s));
-    return FALSE;
-  }
-  GST_DEBUG_OBJECT (self, "VA surface 0x%x created and exported", self->surf);
-  return TRUE;
-}
-
-static GstFlowReturn
-gst_icam_tile4conv_prepare_output_buffer (GstBaseTransform * trans,
-    GstBuffer * inbuf, GstBuffer ** outbuf)
-{
-  GstIcamTile4Conv *self = GST_ICAM_TILE4CONV (trans);
-  GstVideoInfo *vi = &self->in_info;
-  const guint w = GST_VIDEO_INFO_WIDTH (vi), h = GST_VIDEO_INFO_HEIGHT (vi);
-  const guint np = GST_VIDEO_INFO_N_PLANES (vi);
-  gsize offs[GST_VIDEO_MAX_PLANES] = { 0 };
-  gint strides[GST_VIDEO_MAX_PLANES] = { 0 };
-  VADRMPRIMESurfaceDescriptor d = { };
-
-  GST_DEBUG_OBJECT (self, "prepare output for input %" GST_PTR_FORMAT, inbuf);
-  if (!ensure_display (self))
-    return GST_FLOW_ERROR;
-  if (!self->allocator)
-    self->allocator = gst_dmabuf_allocator_new ();
-  if (!export_tile4_surface (self, &d))
-    return GST_FLOW_ERROR;
-
-  GST_DEBUG_OBJECT (self, "export: fourcc %" GST_FOURCC_FORMAT ", %ux%u, "
-      "%u objects, %u layers, fd %d, size %u, modifier 0x%016"
-      G_GINT64_MODIFIER "x", GST_FOURCC_ARGS (d.fourcc), d.width, d.height,
-      d.num_objects, d.num_layers, d.objects[0].fd, d.objects[0].size,
-      (guint64) d.objects[0].drm_format_modifier);
-
-  if (d.num_layers != 1 || d.num_objects != 1 ||
-      d.layers[0].num_planes != np ||
-      d.objects[0].drm_format_modifier != I915_FORMAT_MOD_4_TILED) {
-    GST_ERROR_OBJECT (self, "Unexpected export: %u layers, %u objects, "
-        "%u planes, modifier 0x%" G_GINT64_MODIFIER "x", d.num_layers,
-        d.num_objects, d.layers[0].num_planes,
-        (guint64) d.objects[0].drm_format_modifier);
-    for (guint i = 0; i < d.num_objects; i++)
-      close (d.objects[i].fd);
-    drop_surface (self);
-    return GST_FLOW_ERROR;
-  }
-  for (guint p = 0; p < np; p++) {
-    offs[p] = d.layers[0].offset[p];
-    strides[p] = d.layers[0].pitch[p];
-    GST_DEBUG_OBJECT (self, "output plane %u: offset %" G_GSIZE_FORMAT
-        ", stride %d", p, offs[p], strides[p]);
-  }
-
-  GstBuffer *out = gst_buffer_new ();
-  gst_buffer_append_memory (out,
-      gst_dmabuf_allocator_alloc (self->allocator, d.objects[0].fd,
-          d.objects[0].size));
-  gst_buffer_add_video_meta_full (out, GST_VIDEO_FRAME_FLAG_NONE,
-      GST_VIDEO_INFO_FORMAT (vi), w, h, np, offs, strides);
-
-  gst_buffer_copy_into (out, inbuf,
-      static_cast<GstBufferCopyFlags> (GST_BUFFER_COPY_METADATA |
-          GST_BUFFER_COPY_TIMESTAMPS), 0, -1);
-  *outbuf = out;
-  GST_DEBUG_OBJECT (self, "output buffer ready: %" GST_PTR_FORMAT, out);
-  return GST_FLOW_OK;
+  return GST_BASE_TRANSFORM_CLASS (gst_icam_tile4conv_parent_class)
+      ->decide_allocation (trans, query);
 }
 
 /* ---------- transform ---------- */
@@ -360,25 +239,30 @@ gst_icam_tile4conv_transform (GstBaseTransform * trans, GstBuffer * inbuf,
   const guint w = GST_VIDEO_INFO_WIDTH (vi), h = GST_VIDEO_INFO_HEIGHT (vi);
   DmaMap imap;
 
+  /* surface and display belong to the downstream VA pool */
+  VASurfaceID surf = gst_va_buffer_get_surface (outbuf);
+  GstVaDisplay *display = gst_va_buffer_peek_display (outbuf);
+
+  if (surf == VA_INVALID_ID || !display) {
+    GST_ERROR_OBJECT (self, "Output buffer is not VA-backed");
+    return GST_FLOW_ERROR;
+  }
   GST_DEBUG_OBJECT (self, "transform: pts %" GST_TIME_FORMAT ", surface 0x%x, "
       "input video meta %s", GST_TIME_ARGS (GST_BUFFER_PTS (inbuf)),
-      self->surf, im ? "present" : "missing");
+      surf, im ? "present" : "missing");
 
-  if (self->surf == VA_INVALID_SURFACE)
-    return GST_FLOW_ERROR;
   if (!dma_map (inbuf, FALSE, &imap)) {
     GST_ERROR_OBJECT (self, "Cannot mmap input dmabuf: %s", g_strerror (errno));
-    drop_surface (self);
     return GST_FLOW_ERROR;
   }
 
-  VADisplay dpy = gst_va_display_get_va_dpy (self->display);
+  VADisplay dpy = gst_va_display_get_va_dpy (display);
   VAImage img = { };
   void *dst = NULL;
   GstFlowReturn ret = GST_FLOW_ERROR;
   gboolean have_img = FALSE;
 
-  VAStatus s = vaDeriveImage (dpy, self->surf, &img);
+  VAStatus s = vaDeriveImage (dpy, surf, &img);
   if (s == VA_STATUS_SUCCESS) {
     have_img = TRUE;
     s = vaMapBuffer (dpy, img.buf, &dst);
@@ -429,18 +313,17 @@ gst_icam_tile4conv_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     }
   }
 
-  if (dst)
+ if (dst)
     vaUnmapBuffer (dpy, img.buf);
   if (have_img)
     vaDestroyImage (dpy, img.image_id);
   if (ret == GST_FLOW_OK) {
-    s = vaSyncSurface (dpy, self->surf);
+    s = vaSyncSurface (dpy, surf);
     if (s != VA_STATUS_SUCCESS)
       GST_WARNING_OBJECT (self, "vaSyncSurface failed: %s", vaErrorStr (s));
   }
 
   dma_unmap (&imap);
-  drop_surface (self);          /* the exported fd keeps the memory alive */
   GST_DEBUG_OBJECT (self, "transform done: %s", gst_flow_get_name (ret));
   return ret;
 }
@@ -458,13 +341,7 @@ gst_icam_tile4conv_start (GstBaseTransform * trans)
 static gboolean
 gst_icam_tile4conv_stop (GstBaseTransform * trans)
 {
-  GstIcamTile4Conv *self = GST_ICAM_TILE4CONV (trans);
-
-  GST_INFO_OBJECT (self, "stop, releasing VA display and allocator");
-
-  drop_surface (self);
-  gst_clear_object (&self->display);
-  gst_clear_object (&self->allocator);
+  GST_INFO_OBJECT (trans, "stop");
   return TRUE;
 }
 
@@ -530,7 +407,7 @@ gst_icam_tile4conv_class_init (GstIcamTile4ConvClass * klass)
 
   bt->transform_caps = gst_icam_tile4conv_transform_caps;
   bt->set_caps = gst_icam_tile4conv_set_caps;
-  bt->prepare_output_buffer = gst_icam_tile4conv_prepare_output_buffer;
+  bt->decide_allocation = gst_icam_tile4conv_decide_allocation;
   bt->transform = gst_icam_tile4conv_transform;
   bt->start = gst_icam_tile4conv_start;
   bt->stop = gst_icam_tile4conv_stop;
@@ -541,8 +418,7 @@ static void
 gst_icam_tile4conv_init (GstIcamTile4Conv * self)
 {
   self->device = g_strdup ("/dev/dri/renderD128");
-  self->surf = VA_INVALID_SURFACE;
-  GST_DEBUG_OBJECT (self, "initialized, default device %s", self->device);
+  GST_DEBUG_OBJECT (self, "initialized");
 }
 
 static gboolean
