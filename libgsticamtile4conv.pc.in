@@ -8,5 +8,5 @@ Name: icamtile4conv
 Description: Linear to Intel Tile4 DMABuf converter GStreamer plugin
 URL:
 Version: @VERSION@
-Requires: gstreamer-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0 gbm
+Requires: gstreamer-1.0 gstreamer-video-1.0 gstreamer-allocators-1.0
 Cflags: -I${includedir}/gstreamer-@GST_API_VERSION@

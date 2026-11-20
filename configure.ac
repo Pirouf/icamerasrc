@@ -192,12 +192,6 @@ PKG_CHECK_MODULES([DRM_INTEL], [libdrm_intel], [
 ])
 
 AS_IF([test "x$enable_icamtile4conv" = "xyes"], [
-  PKG_CHECK_MODULES([GBM], [gbm], [
-    AC_SUBST(GBM_CFLAGS)
-    AC_SUBST(GBM_LIBS)
-  ], [
-    AC_MSG_ERROR([Cannot find gbm pkgconfig (install libgbm-dev / mesa-libgbm-devel)])
-  ])
 
   dnl icamtile4conv needs GstVideoInfoDmaDrm (GStreamer >= 1.24)
   GST_TILE4_REQUIRED=1.24.0
@@ -214,13 +208,6 @@ AS_IF([test "x$enable_icamtile4conv" = "xyes"], [
   ])
 ])
 AM_CONDITIONAL([BUILD_TILE4CONV], [test "x$enable_icamtile4conv" = "xyes"])
-
-PKG_CHECK_MODULES([GBM], [gbm], [
-  AC_SUBST(GBM_CFLAGS)
-  AC_SUBST(GBM_LIBS)
-], [
-  AC_MSG_ERROR([Cannot find gbm pkgconfig (install libgbm-dev / mesa-libgbm-devel)])
-])
 
 AS_IF([test "x$enable_gstdrmformat" = "xyes"], [
   PKG_CHECK_MODULES(GST_1_23, [gstreamer-1.0 >= 1.23], [ have_gstdrmformat=yes ], [

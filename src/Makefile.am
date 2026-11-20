@@ -128,14 +128,14 @@ libgsticamtile4conv_la_SOURCES = tile4conv/gstcamtile4conv.cpp
 libgsticamtile4conv_la_CPPFLAGS = \
     $(GST_CFLAGS) \
     $(GST_TILE4_CFLAGS) \
-    $(GBM_CFLAGS) \
+    $(DRM_INTEL_CFLAGS) \
     -std=c++11 \
     -Werror \
     -fstack-protector -fPIE -fPIC -Wformat -Wformat-security
 
 libgsticamtile4conv_la_LIBADD = $(GST_LIBS) \
     $(GST_TILE4_LIBS) \
-    $(GBM_LIBS)
+    $(DRM_INTEL_LIBS)
 
 libgsticamtile4conv_la_LDFLAGS = $(GST_PLUGIN_LDFLAGS) \
     -fPIE -fPIC -Wl,-z,relro -Wl,-z,now

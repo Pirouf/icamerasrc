@@ -4,10 +4,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
-#include <gbm.h>
+#include "libdrm/intel_bufmgr.h"
 #include <drm_fourcc.h>
 #include <gst/gst.h>
 #include <gst/base/gstbasetransform.h>
@@ -18,6 +19,12 @@
 #ifndef I915_FORMAT_MOD_4_TILED
 #define I915_FORMAT_MOD_4_TILED fourcc_mod_code(INTEL, 9)
 #endif
+
+#ifndef I915_TILING_NONE
+#define I915_TILING_NONE 0
+#endif
+
+#define ALIGN_UP(v, a) (((v) + (a) - 1) / (a) * (a))
 
 #define TILE4_MOD_STR ":0x0100000000000009"
 #define TILE_W 128
@@ -44,7 +51,7 @@ struct _GstIcamTile4Conv
   GstVideoInfoDmaDrm in_drm, out_drm;
   GstVideoInfo in_info;
   GstAllocator *allocator;
-  struct gbm_device *gbm;
+  drm_intel_bufmgr *bufmgr;
   int drm_fd;
   gchar *device;
   guint16 swz[TILE_H][TILE_W / 16];     /* [row][16B chunk] -> offset in tile */
@@ -177,25 +184,22 @@ gst_icam_tile4conv_set_caps (GstBaseTransform * trans, GstCaps * incaps,
 
 /* ---------- output allocation ---------- */
 
-static void
-free_bo (gpointer bo)
-{
-  gbm_bo_destroy (static_cast<struct gbm_bo *> (bo));
-}
-
 static gboolean
-ensure_gbm (GstIcamTile4Conv * self)
+ensure_bufmgr (GstIcamTile4Conv * self)
 {
-  if (self->gbm)
+  if (self->bufmgr)
     return TRUE;
   self->drm_fd = open (self->device, O_RDWR | O_CLOEXEC);
   if (self->drm_fd < 0) {
-    GST_ERROR_OBJECT (self, "Cannot open %s", self->device);
+    GST_ERROR_OBJECT (self, "Cannot open %s: %s", self->device,
+        g_strerror (errno));
     return FALSE;
   }
-  self->gbm = gbm_create_device (self->drm_fd);
-  if (!self->gbm) {
-    GST_ERROR_OBJECT (self, "gbm_create_device failed");
+  self->bufmgr = drm_intel_bufmgr_gem_init (self->drm_fd, 4096);
+  if (!self->bufmgr) {
+    GST_ERROR_OBJECT (self, "drm_intel_bufmgr_gem_init failed");
+    close (self->drm_fd);
+    self->drm_fd = -1;
     return FALSE;
   }
   return TRUE;
@@ -207,55 +211,57 @@ gst_icam_tile4conv_prepare_output_buffer (GstBaseTransform * trans,
 {
   GstIcamTile4Conv *self = GST_ICAM_TILE4CONV (trans);
   GstVideoInfo *vi = &self->in_info;
+  const GstVideoFormatInfo *fi = vi->finfo;
   const guint w = GST_VIDEO_INFO_WIDTH (vi), h = GST_VIDEO_INFO_HEIGHT (vi);
-  uint64_t mod = I915_FORMAT_MOD_4_TILED;
+  const guint np = GST_VIDEO_INFO_N_PLANES (vi);
+  gsize offs[GST_VIDEO_MAX_PLANES] = { 0 };
+  gint strides[GST_VIDEO_MAX_PLANES] = { 0 };
+  gsize total = 0;
 
-  if (!ensure_gbm (self))
+  if (!ensure_bufmgr (self))
     return GST_FLOW_ERROR;
   if (!self->allocator)
     self->allocator = gst_dmabuf_allocator_new ();
 
-  struct gbm_bo *bo = gbm_bo_create_with_modifiers2 (self->gbm, w, h,
-      self->out_drm.drm_fourcc, &mod, 1, GBM_BO_USE_RENDERING);
-  if (!bo)
-    bo = gbm_bo_create_with_modifiers2 (self->gbm, w, h,
-        self->out_drm.drm_fourcc, &mod, 1, GBM_BO_USE_WRITE);
-  if (!bo)
-    bo = gbm_bo_create_with_modifiers2 (self->gbm, w, h,
-        self->out_drm.drm_fourcc, &mod, 1, 0);
+  /* Tile4 layout: stride multiple of 128B, rows padded to 32, 4KB-aligned planes */
+  for (guint p = 0; p < np; p++) {
+    const gsize row_bytes = GST_VIDEO_FORMAT_INFO_PSTRIDE (fi, p) *
+        GST_VIDEO_FORMAT_INFO_SCALE_WIDTH (fi, p, w);
+    const guint rows = GST_VIDEO_FORMAT_INFO_SCALE_HEIGHT (fi, p, h);
+
+    strides[p] = (gint) ALIGN_UP (row_bytes, TILE_W);
+    offs[p] = total;
+    total += ALIGN_UP ((gsize) rows, TILE_H) * strides[p];
+    total = ALIGN_UP (total, TILE_SIZE);
+  }
+
+  /* Linear GEM object: one 4KB "row" per tile, 1 byte per pixel */
+  uint32_t tiling = I915_TILING_NONE;
+  unsigned long pitch = 0;
+  drm_intel_bo *bo = drm_intel_bo_alloc_tiled (self->bufmgr, "ICAM_TILE4",
+      TILE_SIZE, (int) (total / TILE_SIZE), 1, &tiling, &pitch, 0);
   if (!bo) {
-    GST_ERROR_OBJECT (self,
-        "gbm_bo_create_with_modifiers2 failed for Tile4 (%ux%u fourcc %.4s, "
-        "format supported: %d, errno %d: %s)", w, h,
-        (const char *) &self->out_drm.drm_fourcc,
-        gbm_device_is_format_supported (self->gbm, self->out_drm.drm_fourcc,
-            GBM_BO_USE_RENDERING), errno, g_strerror (errno));
+    GST_ERROR_OBJECT (self, "drm_intel_bo_alloc_tiled failed for %zu bytes",
+        (size_t) total);
     return GST_FLOW_ERROR;
   }
 
-  int fd = gbm_bo_get_fd_for_plane (bo, 0);
-  off_t size = fd >= 0 ? lseek (fd, 0, SEEK_END) : -1;
-  if (fd < 0 || size <= 0) {
+  int fd = -1;
+  drm_intel_bo_gem_export_to_prime (bo, &fd);
+  const gsize bo_size = bo->size;
+  /* the dmabuf fd keeps the buffer alive */
+  drm_intel_bo_unreference (bo);
+  if (fd < 0 || bo_size < total) {
+    GST_ERROR_OBJECT (self, "PRIME export failed (fd %d, size %zu < %zu)",
+        fd, (size_t) bo_size, (size_t) total);
     if (fd >= 0)
       close (fd);
-    gbm_bo_destroy (bo);
     return GST_FLOW_ERROR;
   }
-  lseek (fd, 0, SEEK_SET);
 
   GstBuffer *out = gst_buffer_new ();
   gst_buffer_append_memory (out,
-      gst_dmabuf_allocator_alloc (self->allocator, fd, (gsize) size));
-  gst_mini_object_set_qdata (GST_MINI_OBJECT (out),
-      g_quark_from_static_string ("icam-gbm-bo"), bo, free_bo);
-
-  gsize offs[GST_VIDEO_MAX_PLANES] = { 0 };
-  gint strides[GST_VIDEO_MAX_PLANES] = { 0 };
-  const guint np = GST_VIDEO_INFO_N_PLANES (vi);
-  for (guint p = 0; p < np; p++) {
-    offs[p] = gbm_bo_get_offset (bo, p);
-    strides[p] = (gint) gbm_bo_get_stride_for_plane (bo, p);
-  }
+      gst_dmabuf_allocator_alloc (self->allocator, fd, bo_size));
   gst_buffer_add_video_meta_full (out, GST_VIDEO_FRAME_FLAG_NONE,
       GST_VIDEO_INFO_FORMAT (vi), w, h, np, offs, strides);
 
@@ -318,9 +324,9 @@ gst_icam_tile4conv_stop (GstBaseTransform * trans)
 {
   GstIcamTile4Conv *self = GST_ICAM_TILE4CONV (trans);
 
-  if (self->gbm)
-    gbm_device_destroy (self->gbm);
-  self->gbm = NULL;
+  if (self->bufmgr)
+    drm_intel_bufmgr_destroy (self->bufmgr);
+  self->bufmgr = NULL;
   if (self->drm_fd >= 0)
     close (self->drm_fd);
   self->drm_fd = -1;
