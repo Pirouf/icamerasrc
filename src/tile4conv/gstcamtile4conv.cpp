@@ -178,6 +178,7 @@ ensure_display (GstIcamTile4Conv * self)
   if (self->display)
     return TRUE;
   GST_INFO_OBJECT (self, "creating VA display on %s", self->device);
+  self->display = gst_va_display_drm_new_from_path (self->device);
   if (!self->display) {
     GST_ERROR_OBJECT (self, "Cannot create VA display on %s", self->device);
     return FALSE;
@@ -432,8 +433,11 @@ gst_icam_tile4conv_transform (GstBaseTransform * trans, GstBuffer * inbuf,
     vaUnmapBuffer (dpy, img.buf);
   if (have_img)
     vaDestroyImage (dpy, img.image_id);
-  if (ret == GST_FLOW_OK)
-    vaSyncSurface (dpy, self->surf);
+  if (ret == GST_FLOW_OK) {
+    s = vaSyncSurface (dpy, self->surf);
+    if (s != VA_STATUS_SUCCESS)
+      GST_WARNING_OBJECT (self, "vaSyncSurface failed: %s", vaErrorStr (s));
+  }
 
   dma_unmap (&imap);
   drop_surface (self);          /* the exported fd keeps the memory alive */
