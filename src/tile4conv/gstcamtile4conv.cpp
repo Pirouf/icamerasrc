@@ -217,13 +217,19 @@ gst_icam_tile4conv_prepare_output_buffer (GstBaseTransform * trans,
 
   struct gbm_bo *bo = gbm_bo_create_with_modifiers2 (self->gbm, w, h,
       self->out_drm.drm_fourcc, &mod, 1, GBM_BO_USE_RENDERING);
+  if (!bo)
+    bo = gbm_bo_create_with_modifiers2 (self->gbm, w, h,
+        self->out_drm.drm_fourcc, &mod, 1, GBM_BO_USE_WRITE);
+  if (!bo)
+    bo = gbm_bo_create_with_modifiers2 (self->gbm, w, h,
+        self->out_drm.drm_fourcc, &mod, 1, 0);
   if (!bo) {
-    GST_ERROR_OBJECT (self, "gbm_bo_create_with_modifiers2 failed for Tile4");
-    return GST_FLOW_ERROR;
-  }
-  if (gbm_bo_get_modifier (bo) != I915_FORMAT_MOD_4_TILED) {
-    GST_ERROR_OBJECT (self, "GBM returned unexpected modifier");
-    gbm_bo_destroy (bo);
+    GST_ERROR_OBJECT (self,
+        "gbm_bo_create_with_modifiers2 failed for Tile4 (%ux%u fourcc %.4s, "
+        "format supported: %d, errno %d: %s)", w, h,
+        (const char *) &self->out_drm.drm_fourcc,
+        gbm_device_is_format_supported (self->gbm, self->out_drm.drm_fourcc,
+            GBM_BO_USE_RENDERING), errno, g_strerror (errno));
     return GST_FLOW_ERROR;
   }
 
